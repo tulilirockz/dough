@@ -1,6 +1,8 @@
 const std = @import("std");
 const yazap = @import("yazap");
 const yaml = @import("yaml");
+const parted = @cImport(@cInclude("parted/parted.h"));
+
 const Arg = yazap.Arg;
 
 fn osMessage(file: std.fs.File, data: []const u8) !usize {
@@ -77,7 +79,7 @@ pub fn main() !void {
 
         for (shrimp.disks) |_| {
             // Get the disk, get the partitions and whatever else, then print that we are going to change these speciifc things with a git-like diff
-
+            // std.debug.print("yeah {d}", .{fdisk.fdisk_parse_version_string("thing")});
         }
     }
 }

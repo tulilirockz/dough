@@ -4,3 +4,7 @@ zig-*/
 build
 util-linux
 .cache
+*.img
+*.raw
+out
+result

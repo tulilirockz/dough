@@ -13,11 +13,10 @@
         default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             glibc
-            parted
-          ]; 
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-            pkgs.stdenv.cc.cc
+            util-linux.dev
           ];
+          C_INCLUDE_PATH = "${pkgs.util-linux.dev}/include";
+          LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc ]}";
           packages = with pkgs; [
             zig
             meson

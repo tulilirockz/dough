@@ -14,9 +14,10 @@
           nativeBuildInputs = with pkgs; [
             glibc
             util-linux.dev
+            util-linux
           ];
           C_INCLUDE_PATH = "${pkgs.util-linux.dev}/include";
-          LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc ]}";
+          LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc pkgs.util-linux]}";
           packages = with pkgs; [
             zig
             meson

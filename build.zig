@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addImport("yazap", b.dependency("yazap", .{}).module("yazap"));
     exe.root_module.addImport("yaml", b.dependency("zig-yaml", .{}).module("yaml"));
     exe.linkLibC();
+    exe.linkSystemLibrary("fdisk");
 
     b.installArtifact(exe);
 

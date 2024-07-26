@@ -1,0 +1,15 @@
+---
+version: "0.1.0"
+disks:
+  # - device: "/persist/home/tulili/opt/tulilirockz/portable-environment/dough/test.img"
+  - device: "/dev/sda"
+    partitions:
+      - label: test
+        type: EF00
+        size: "500M"
+        format: vfat
+      - label: test2
+        type: EF43
+        filesystem: ext4
+        size: "100%FREE"   
+  

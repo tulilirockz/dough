@@ -15,6 +15,9 @@
             util-linux.dev
             util-linux
           ];
+          shellHook = ''
+            PATH=$PATH:$PWD/zig-out/bin
+          '';
           C_INCLUDE_PATH = "${pkgs.util-linux.dev}/include";
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc pkgs.util-linux]}";
           packages = with pkgs; [

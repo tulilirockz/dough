@@ -9,10 +9,10 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     exe.root_module.addImport("yazap", b.dependency("yazap", .{}).module("yazap"));
     exe.root_module.addImport("yaml", b.dependency("zig-yaml", .{}).module("yaml"));
-    exe.linkLibC();
     exe.linkSystemLibrary("fdisk");
 
     b.installArtifact(exe);

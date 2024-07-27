@@ -12,7 +12,6 @@
       devShells = forEachSupportedSystem ({ pkgs }: {
         default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
-            glibc
             util-linux.dev
             util-linux
           ];
@@ -20,13 +19,6 @@
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc pkgs.util-linux]}";
           packages = with pkgs; [
             zig
-            meson
-            flex
-            bison
-            autoconf
-            gettext
-            libtool
-            automake
           ];
         };
       });

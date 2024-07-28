@@ -43,16 +43,10 @@ const PartitionParsingErrors = error{
     InvalidPartition,
 };
 
-fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context) !std.ArrayList(Partition) {
+fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context, partable: *fdisk.struct_fdisk_table) !std.ArrayList(Partition) {
     if (fdisk.fdisk_get_npartitions(cxt) == 0) {
         return PartitionParsingErrors.NoPartitions;
     }
-
-    const partable = fdisk.fdisk_new_table() orelse {
-        return error.OutOfMemory;
-    };
-    // FIXME: Unreferencing the table here will cause some funky data to be printed in the *_get_uuid and *_get_name functions
-    // defer fdisk.fdisk_unref_table(partable);
 
     if (fdisk.fdisk_get_partitions(cxt, @ptrCast(@alignCast(partable))) != 0) {
         return error.OutOfMemory;
@@ -100,10 +94,12 @@ fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context) !
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = gpa.deinit();
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var app = yazap.App.init(alloc, "dough", "Declarative disk management utility");
+    var app = yazap.App.init(std.heap.page_allocator, "dough", "Declarative disk management utility");
     defer app.deinit();
 
     var root = app.rootCommand();
@@ -155,6 +151,19 @@ pub fn main() !void {
         return;
     }
 
+    if (args.subcommandMatches("destroy")) |matches| {
+        if (!matches.containsArgs()) {
+            try app.displayHelp();
+            return;
+        }
+
+        // const device_path = matches.getSingleValue("DECLARATION") orelse {
+        //     std.log.err("Must contain argument [DECLARATION]\n", .{});
+        //     try app.displayHelp();
+        //     return;
+        // };
+    }
+
     if (args.subcommandMatches("check")) |matches| {
         if (!matches.containsArgs()) {
             try app.displayHelp();
@@ -172,6 +181,7 @@ pub fn main() !void {
         defer file.close();
 
         const data = try file.reader().readAllAlloc(alloc, 2048);
+        defer alloc.free(data);
 
         if (std.mem.eql(u8, selected_format, "json")) {
             _ = try std.json.parseFromSlice(Declaration, alloc, data, .{ .duplicate_field_behavior = .@"error", .ignore_unknown_fields = false });
@@ -200,6 +210,7 @@ pub fn main() !void {
 
         const selected_format = matches.getSingleValue("format") orelse "json";
         const device_filepath = try std.fs.realpathAlloc(alloc, device_path);
+        defer alloc.free(device_filepath);
 
         const context = fdisk.fdisk_new_context() orelse {
             return error.OutOfMemory;
@@ -212,7 +223,11 @@ pub fn main() !void {
         }
         defer _ = fdisk.fdisk_deassign_device(context, 1);
 
-        const partitions = get_context_partitions(alloc, context) catch |e| switch (e) {
+        const partable = fdisk.fdisk_new_table() orelse {
+            return error.OutOfMemory;
+        };
+        defer fdisk.fdisk_unref_table(partable);
+        const partitions = get_context_partitions(alloc, context, partable) catch |e| switch (e) {
             error.NoPartitions => {
                 std.log.err("Failure finding partitions in device {s}", .{device_filepath});
                 return;
@@ -271,7 +286,11 @@ pub fn main() !void {
         }
         defer _ = fdisk.fdisk_deassign_device(context, 1);
 
-        const partitions = get_context_partitions(alloc, context) catch |e| switch (e) {
+        const partable = fdisk.fdisk_new_table() orelse {
+            return error.OutOfMemory;
+        };
+        defer fdisk.fdisk_unref_table(partable);
+        const partitions = get_context_partitions(alloc, context, partable) catch |e| switch (e) {
             error.NoPartitions => {
                 std.log.err("Failure finding partitions in device {s}", .{device_path});
                 return;

@@ -135,13 +135,13 @@ pub fn main() !void {
     });
     try root.addSubcommand(check);
 
-    var info = app.createCommand("info", "Display device partitioning information");
-    try info.addArgs(&[_]Arg{
+    var dump = app.createCommand("dump", "Display device partitioning information");
+    try dump.addArgs(&[_]Arg{
         Arg.positional("DEVICE", "Device to be inspected", null),
         Arg.booleanOption("quiet", 'q', "Only return data without any logging"),
         Arg.singleValueOptionWithValidValues("format", 'f', "Format that will be output", &[_][]const u8{ "json", "yaml" }),
     });
-    try root.addSubcommand(info);
+    try root.addSubcommand(dump);
 
     const args = try app.parseProcess();
 
@@ -171,7 +171,7 @@ pub fn main() !void {
         const file = try std.fs.openFileAbsolute(declaration_filepath, .{});
         defer file.close();
 
-        const data = try file.reader().readAllAlloc(alloc, 512);
+        const data = try file.reader().readAllAlloc(alloc, 2048);
 
         if (std.mem.eql(u8, selected_format, "json")) {
             _ = try std.json.parseFromSlice(Declaration, alloc, data, .{ .duplicate_field_behavior = .@"error", .ignore_unknown_fields = false });
@@ -187,7 +187,7 @@ pub fn main() !void {
         }
     }
 
-    if (args.subcommandMatches("info")) |matches| {
+    if (args.subcommandMatches("dump")) |matches| {
         if (!matches.containsArgs()) {
             try app.displayHelp();
             return;

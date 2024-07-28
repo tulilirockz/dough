@@ -8,6 +8,7 @@ const Arg = yazap.Arg;
 
 const Declaration = struct {
     version: []const u8,
+    // labels: []const u8,
     partitions: []const Partition,
 };
 
@@ -110,7 +111,9 @@ pub fn main() !void {
     try root.addSubcommand(apply);
 
     var destroy = app.createCommand("destroy", "Destroy the partition table data from disk");
-    try destroy.addArgs(&[_]Arg{Arg.positional("DEVICE", null, null)});
+    try destroy.addArgs(
+        &[_]Arg{ Arg.positional("DEVICE", null, null), Arg.booleanOption("quiet", 'q', "Only return data without any logging"), Arg.singleValueOptionWithValidValues("format", 'f', "Disk label partition type to be used", &[_][]const u8{ "sun", "dos", "gpt", "sgi" }) },
+    );
     try root.addSubcommand(destroy);
 
     var plan = app.createCommand("plan", "Plan changes before formatting device");
@@ -157,11 +160,62 @@ pub fn main() !void {
             return;
         }
 
-        // const device_path = matches.getSingleValue("DECLARATION") orelse {
-        //     std.log.err("Must contain argument [DECLARATION]\n", .{});
-        //     try app.displayHelp();
-        //     return;
-        // };
+        const device_path = matches.getSingleValue("DEVICE") orelse {
+            std.log.err("Must contain argument [DEVICE]\n", .{});
+            try app.displayHelp();
+            return;
+        };
+
+        const device_filepath = try std.fs.realpathAlloc(alloc, device_path);
+
+        const context = fdisk.fdisk_new_context() orelse {
+            return error.OutOfMemory;
+        };
+        defer _ = fdisk.fdisk_unref_context(context);
+
+        if (fdisk.fdisk_assign_device(context, @ptrCast(device_filepath), 0) != 0) {
+            std.log.err("Failed assigning to device {s}", .{device_path});
+            return;
+        }
+        defer _ = fdisk.fdisk_deassign_device(context, 1);
+
+        if (fdisk.fdisk_enable_wipe(context, 1) != 0) {
+            std.log.err("Failure enabling wipe mode for device {s}", .{device_filepath});
+            return;
+        }
+
+        const partable = fdisk.fdisk_new_table() orelse {
+            return error.OutOfMemory;
+        };
+        defer fdisk.fdisk_unref_table(partable);
+
+        var currpart: usize = 0;
+        while (fdisk.fdisk_table_get_partition(partable, currpart)) |partition| : (currpart += 1) {
+            var partno: ?usize = null;
+            if (fdisk.fdisk_partition_has_partno(partition) != 0) {
+                return error.NoPartitions;
+            }
+            partno = fdisk.fdisk_partition_get_partno(partition);
+
+            if (fdisk.fdisk_wipe_partition(context, partno.?, 1) <= 0) {
+                return error.NoPartitions;
+            }
+        }
+
+        const labeltype = matches.getSingleValue("format") orelse "gpt";
+        if (fdisk.fdisk_create_disklabel(context, @ptrCast(labeltype)) != 0) {
+            std.log.err("Failed creating new disk label with specified type {s}", .{labeltype});
+            return;
+        }
+        if (fdisk.fdisk_write_disklabel(context) != 0) {
+            std.log.err("Failed writing new disk label with specified type {s}", .{labeltype});
+            return;
+        }
+
+        if (!matches.containsArg("quiet")) {
+            std.log.info("Succesfully wiped device {s} and written a {s} disk label over it", .{ device_filepath, labeltype });
+        }
+        return;
     }
 
     if (args.subcommandMatches("check")) |matches| {

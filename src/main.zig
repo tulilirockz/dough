@@ -3,12 +3,12 @@ const yazap = @import("yazap");
 const yaml = @import("yaml");
 const fdisk = @cImport(@cInclude("libfdisk/libfdisk.h"));
 
-const DOUGH_VERSION = "v0.1.2";
+const DOUGH_VERSION = "v0.1.3";
 const Arg = yazap.Arg;
 
 const Declaration = struct {
-    version: []const u8,
-    // labels: []const u8,
+    dough: []const u8 = DOUGH_VERSION,
+    label: []const u8,
     partitions: []const Partition,
 };
 
@@ -18,6 +18,7 @@ const Partition = struct {
     type: PartitionType,
     uuid: []const u8,
     name: []const u8,
+    attrs: ?[]const u8,
     partno: ?usize,
     size: ?u64,
     start: ?u64,
@@ -63,6 +64,7 @@ fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context, p
         if (fdisk.fdisk_partition_has_start(partition) == 0) {
             return PartitionParsingErrors.InvalidPartition;
         }
+
         var pushpart: Partition = .{
             .type = PartitionType{
                 .code = fdisk.fdisk_parttype_get_code(parttype),
@@ -72,6 +74,7 @@ fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context, p
             .name = std.mem.span(fdisk.fdisk_partition_get_name(partition)),
             .uuid = std.mem.span(fdisk.fdisk_partition_get_uuid(partition)),
             .start = fdisk.fdisk_partition_get_start(partition),
+            .attrs = null,
             .end = null,
             .size = null,
             .partno = null,
@@ -95,8 +98,6 @@ fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context, p
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = gpa.deinit();
     defer arena.deinit();
     const alloc = arena.allocator();
 
@@ -104,10 +105,16 @@ pub fn main() !void {
     defer app.deinit();
 
     var root = app.rootCommand();
-    try root.addArg(Arg.booleanOption("version", null, null));
+    try root.addArg(Arg.booleanOption("version", 'v', "Show version number"));
+    try root.addArg(Arg.booleanOption("debug", 'd', "Enable debug mode in disk partitioning"));
 
     var apply = app.createCommand("apply", "Format device using manifest as the base");
-    try apply.addArgs(&[_]Arg{ Arg.positional("DEVICE", null, null), Arg.positional("DECLARATION", null, null) });
+    try apply.addArgs(&[_]Arg{
+        Arg.positional("DEVICE", null, null),
+        Arg.positional("DECLARATION", null, null),
+        Arg.singleValueOptionWithValidValues("format", 'f', "Configuration format that will be parsed from", &[_][]const u8{ "json", "yaml" }),
+        Arg.booleanOption("quiet", 'q', "Only return data without any logging"),
+    });
     try root.addSubcommand(apply);
 
     var destroy = app.createCommand("destroy", "Destroy the partition table data from disk");
@@ -154,6 +161,95 @@ pub fn main() !void {
         return;
     }
 
+    if (args.containsArg("debug")) {
+        std.log.info("Enabled full debug mode in libfdisk", .{});
+        fdisk.fdisk_init_debug(0xffff);
+    }
+
+    if (args.subcommandMatches("apply")) |matches| {
+        if (!matches.containsArgs()) {
+            try app.displayHelp();
+            return;
+        }
+
+        const device_path = matches.getSingleValue("DEVICE") orelse {
+            std.log.err("Must contain argument [DEVICE]\n", .{});
+            try app.displayHelp();
+            return;
+        };
+
+        const declaration_path = matches.getSingleValue("DECLARATION") orelse {
+            std.log.err("Must contain argument [DECLARATION]\n", .{});
+            try app.displayHelp();
+            return;
+        };
+
+        const declaration_filepath = try std.fs.realpathAlloc(alloc, declaration_path);
+        const format = matches.getSingleValue("format") orelse "json";
+
+        const file = try std.fs.openFileAbsolute(declaration_filepath, .{});
+        defer file.close();
+
+        const filedata = try file.reader().readAllAlloc(alloc, 2048);
+        defer alloc.free(filedata);
+
+        var decl: ?Declaration = null;
+        if (std.mem.eql(u8, format, "json")) {
+            decl = try std.json.parseFromSliceLeaky(Declaration, alloc, filedata, .{});
+        } else if (std.mem.eql(u8, format, "yaml")) {
+            var untyped = try yaml.Yaml.load(alloc, filedata);
+            defer untyped.deinit();
+            decl = try untyped.parse(Declaration);
+        }
+
+        const context = fdisk.fdisk_new_context() orelse {
+            return error.OutOfMemory;
+        };
+        defer _ = fdisk.fdisk_unref_context(context);
+
+        const device_filepath = try std.fs.realpathAlloc(alloc, device_path);
+        defer alloc.free(device_filepath);
+        if (fdisk.fdisk_assign_device(context, @ptrCast(device_path), 0) != 0) {
+            std.log.err("Failed assigning to device {s}", .{device_path});
+            return;
+        }
+        defer _ = fdisk.fdisk_deassign_device(context, 0);
+
+        if (fdisk.fdisk_enable_wipe(context, 1) != 0) {
+            std.log.err("Failure enabling wipe mode for device {s}", .{device_filepath});
+            return;
+        }
+
+        if (fdisk.fdisk_create_disklabel(context, "gpt") != 0) {
+            return error.Unimplemented;
+        }
+        const table = fdisk.fdisk_new_table();
+        defer fdisk.fdisk_unref_table(table);
+
+        for (decl.?.partitions) |partition| {
+            const newpart = fdisk.fdisk_new_partition() orelse {
+                return error.OutOfMemory;
+            };
+            defer _ = fdisk.fdisk_unref_partition(newpart);
+            _ = fdisk.fdisk_partition_set_start(newpart, partition.start.?);
+            _ = fdisk.fdisk_partition_set_partno(newpart, partition.partno.?);
+            _ = fdisk.fdisk_partition_set_size(newpart, partition.size.?);
+            _ = fdisk.fdisk_table_add_partition(table, newpart);
+            // UUIDs are applied automatically
+            // _ = fdisk.fdisk_partition_set_attrs(newpart, @ptrCast(partition.attrs.?));
+        }
+        if (fdisk.fdisk_apply_table(context, table) != 0) {
+            std.log.err("Failed writing partition table to memory", .{});
+            return error.OutOfMemory;
+        }
+        if (fdisk.fdisk_write_disklabel(context) != 0) {
+            std.log.err("Failed applying partition table and disklabel information to device {s}", .{device_filepath});
+            return;
+        }
+        if (!matches.containsArg("quiet"))
+            std.log.info("Succesfully partitioned device {s}", .{device_filepath});
+    }
+
     if (args.subcommandMatches("destroy")) |matches| {
         if (!matches.containsArgs()) {
             try app.displayHelp();
@@ -189,17 +285,9 @@ pub fn main() !void {
         };
         defer fdisk.fdisk_unref_table(partable);
 
-        var currpart: usize = 0;
-        while (fdisk.fdisk_table_get_partition(partable, currpart)) |partition| : (currpart += 1) {
-            var partno: ?usize = null;
-            if (fdisk.fdisk_partition_has_partno(partition) != 0) {
-                return error.NoPartitions;
-            }
-            partno = fdisk.fdisk_partition_get_partno(partition);
-
-            if (fdisk.fdisk_wipe_partition(context, partno.?, 1) <= 0) {
-                return error.NoPartitions;
-            }
+        if (fdisk.fdisk_delete_all_partitions(context) != 0) {
+            std.log.err("Failed deleting partition table data", .{});
+            return;
         }
 
         const labeltype = matches.getSingleValue("format") orelse "gpt";
@@ -300,15 +388,25 @@ pub fn main() !void {
             },
         };
         defer partitions.deinit();
+        const disklabel = fdisk.fdisk_get_label(context, null) orelse {
+            std.log.err("Failed parsing partition label information from disk {s}", .{device_filepath});
+            return;
+        };
+        const disklabel_name = std.mem.span(fdisk.fdisk_label_get_name(disklabel));
+
+        const printed: Declaration = .{
+            .label = disklabel_name,
+            .partitions = partitions.items,
+        };
 
         if (!matches.containsArg("quiet")) {
             std.log.info("{s}:", .{device_filepath});
         }
 
         if (std.mem.eql(u8, selected_format, "json")) {
-            try std.json.stringify(partitions.items, defaultStringify, std.io.getStdOut().writer());
+            try std.json.stringify(printed, defaultStringify, std.io.getStdOut().writer());
         } else if (std.mem.eql(u8, selected_format, "yaml")) {
-            try yaml.stringify(alloc, partitions.items, std.io.getStdOut().writer());
+            try yaml.stringify(alloc, printed, std.io.getStdOut().writer());
         }
         return;
     }
@@ -344,6 +442,7 @@ pub fn main() !void {
             return error.OutOfMemory;
         };
         defer fdisk.fdisk_unref_table(partable);
+
         const partitions = get_context_partitions(alloc, context, partable) catch |e| switch (e) {
             error.NoPartitions => {
                 std.log.err("Failure finding partitions in device {s}", .{device_path});

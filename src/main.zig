@@ -3,7 +3,7 @@ const yazap = @import("yazap");
 const yaml = @import("yaml");
 const fdisk = @cImport(@cInclude("libfdisk/libfdisk.h"));
 
-const DOUGH_VERSION = "v0.1.3";
+const DOUGH_VERSION = "v0.1.4";
 const Arg = yazap.Arg;
 
 const Declaration = struct {
@@ -18,7 +18,6 @@ const Partition = struct {
     type: PartitionType,
     uuid: []const u8,
     name: []const u8,
-    attrs: ?[]const u8,
     partno: ?usize,
     size: ?u64,
     start: ?u64,
@@ -32,7 +31,7 @@ const PartitionType = struct {
     flags: []const u8,
 };
 
-const defaultStringify = std.json.StringifyOptions{
+const DEFAULT_STRINGIFY = std.json.StringifyOptions{
     .whitespace = .indent_4,
     .emit_null_optional_fields = true,
     .emit_strings_as_arrays = false,
@@ -44,6 +43,35 @@ const PartitionParsingErrors = error{
     NoPartType,
     InvalidPartition,
 };
+
+const TextDataFormat = enum {
+    json,
+    yaml,
+};
+
+const DefaultDataFormat = struct {
+    @"enum": TextDataFormat = .json,
+    str: []const u8 = "json",
+};
+const DEFAULT_DATA_FORMAT: DefaultDataFormat = .{};
+
+fn stringify_to_writer(allocator: std.mem.Allocator, input: anytype, output: anytype, format: TextDataFormat) !void {
+    switch (format) {
+        .json => _ = try output.write(try std.json.stringifyAlloc(allocator, input, DEFAULT_STRINGIFY)),
+        .yaml => try yaml.stringify(allocator, input, output),
+    }
+}
+
+fn parse_formatted_text_data(comptime T: type, allocator: std.mem.Allocator, filedata: *const []const u8, format: TextDataFormat) !T {
+    switch (format) {
+        .json => return try std.json.parseFromSliceLeaky(T, allocator, filedata.*, .{}),
+        .yaml => {
+            var untyped = try yaml.Yaml.load(allocator, filedata.*);
+            defer untyped.deinit();
+            return try untyped.parse(T);
+        },
+    }
+}
 
 fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context, partable: *fdisk.struct_fdisk_table) !std.ArrayList(Partition) {
     if (fdisk.fdisk_get_npartitions(cxt) == 0) {
@@ -74,23 +102,20 @@ fn get_context_partitions(alloc: std.mem.Allocator, cxt: *fdisk.fdisk_context, p
             .name = std.mem.span(fdisk.fdisk_partition_get_name(partition)),
             .uuid = std.mem.span(fdisk.fdisk_partition_get_uuid(partition)),
             .start = fdisk.fdisk_partition_get_start(partition),
-            .attrs = null,
             .end = null,
             .size = null,
             .partno = null,
         };
 
-        if (fdisk.fdisk_partition_has_partno(partition) != 0) {
+        if (fdisk.fdisk_partition_has_partno(partition) != 0)
             pushpart.partno = fdisk.fdisk_partition_get_partno(partition);
-        }
 
-        if (fdisk.fdisk_partition_has_end(partition) != 0) {
+        if (fdisk.fdisk_partition_has_end(partition) != 0)
             pushpart.end = fdisk.fdisk_partition_get_end(partition);
-        }
 
-        if (fdisk.fdisk_partition_has_size(partition) != 0) {
+        if (fdisk.fdisk_partition_has_size(partition) != 0)
             pushpart.size = fdisk.fdisk_partition_get_size(partition);
-        }
+
         try partitions.append(pushpart);
     }
     return partitions;
@@ -168,39 +193,37 @@ pub fn main() !void {
 
     if (args.subcommandMatches("apply")) |matches| {
         if (!matches.containsArgs()) {
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         }
 
         const device_path = matches.getSingleValue("DEVICE") orelse {
             std.log.err("Must contain argument [DEVICE]\n", .{});
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         };
-
         const declaration_path = matches.getSingleValue("DECLARATION") orelse {
             std.log.err("Must contain argument [DECLARATION]\n", .{});
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         };
 
-        const declaration_filepath = try std.fs.realpathAlloc(alloc, declaration_path);
-        const format = matches.getSingleValue("format") orelse "json";
+        const declaration_filepath = std.fs.realpathAlloc(alloc, declaration_path) catch declaration_path;
 
-        const file = try std.fs.openFileAbsolute(declaration_filepath, .{});
-        defer file.close();
+        var openfile = if (std.mem.eql(u8, declaration_path, "_")) std.io.getStdIn() else (try std.fs.openFileAbsolute(declaration_filepath, .{}));
+        defer openfile.close();
 
-        const filedata = try file.reader().readAllAlloc(alloc, 2048);
+        const file = openfile.reader();
+        var freader = std.io.bufferedReader(file);
+        var read = freader.reader();
+        const filedata = try read.readAllAlloc(alloc, 4096);
         defer alloc.free(filedata);
 
-        var decl: ?Declaration = null;
-        if (std.mem.eql(u8, format, "json")) {
-            decl = try std.json.parseFromSliceLeaky(Declaration, alloc, filedata, .{});
-        } else if (std.mem.eql(u8, format, "yaml")) {
-            var untyped = try yaml.Yaml.load(alloc, filedata);
-            defer untyped.deinit();
-            decl = try untyped.parse(Declaration);
-        }
+        const format = if (std.mem.eql(u8, matches.getSingleValue("format") orelse "json", "json")) TextDataFormat.json else TextDataFormat.yaml;
+        const decl = parse_formatted_text_data(Declaration, alloc, &filedata, format) catch |e| {
+            std.log.err("Failed parsing data", .{});
+            return e;
+        };
 
         const context = fdisk.fdisk_new_context() orelse {
             return error.OutOfMemory;
@@ -220,45 +243,62 @@ pub fn main() !void {
             return;
         }
 
-        if (fdisk.fdisk_create_disklabel(context, "gpt") != 0) {
+        const label = try alloc.dupeZ(u8, decl.label);
+        defer alloc.free(label);
+        if (fdisk.fdisk_has_label(context) != 0) {
+            if (fdisk.fdisk_create_disklabel(context, label.ptr) != 0) {
+                return error.Unimplemented;
+            }
+            _ = fdisk.fdisk_write_disklabel(context);
+        }
+
+        if (fdisk.fdisk_create_disklabel(context, label.ptr) != 0) {
             return error.Unimplemented;
         }
         const table = fdisk.fdisk_new_table();
         defer fdisk.fdisk_unref_table(table);
 
-        for (decl.?.partitions) |partition| {
+        for (decl.partitions) |partition| {
             const newpart = fdisk.fdisk_new_partition() orelse {
                 return error.OutOfMemory;
             };
             defer _ = fdisk.fdisk_unref_partition(newpart);
-            _ = fdisk.fdisk_partition_set_start(newpart, partition.start.?);
-            _ = fdisk.fdisk_partition_set_partno(newpart, partition.partno.?);
-            _ = fdisk.fdisk_partition_set_size(newpart, partition.size.?);
-            _ = fdisk.fdisk_table_add_partition(table, newpart);
+
+            const parttype = fdisk.fdisk_new_parttype();
+            _ = fdisk.fdisk_parttype_set_code(parttype, @intCast(partition.type.code));
+            _ = fdisk.fdisk_parttype_set_name(parttype, @ptrCast(partition.type.name));
+
             // UUIDs are applied automatically
-            // _ = fdisk.fdisk_partition_set_attrs(newpart, @ptrCast(partition.attrs.?));
+            _ = fdisk.fdisk_partition_set_start(newpart, partition.start orelse return error.Unimplemented);
+            _ = fdisk.fdisk_partition_set_partno(newpart, partition.partno orelse return error.Unimplemented);
+            _ = fdisk.fdisk_partition_set_size(newpart, partition.size orelse return error.Unimplemented);
+            _ = fdisk.fdisk_partition_set_type(newpart, parttype);
+            _ = fdisk.fdisk_table_add_partition(table, newpart);
         }
+
         if (fdisk.fdisk_apply_table(context, table) != 0) {
             std.log.err("Failed writing partition table to memory", .{});
-            return error.OutOfMemory;
+            return;
         }
+
         if (fdisk.fdisk_write_disklabel(context) != 0) {
             std.log.err("Failed applying partition table and disklabel information to device {s}", .{device_filepath});
             return;
         }
+
         if (!matches.containsArg("quiet"))
             std.log.info("Succesfully partitioned device {s}", .{device_filepath});
     }
 
     if (args.subcommandMatches("destroy")) |matches| {
         if (!matches.containsArgs()) {
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         }
 
         const device_path = matches.getSingleValue("DEVICE") orelse {
             std.log.err("Must contain argument [DEVICE]\n", .{});
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         };
 
@@ -285,9 +325,11 @@ pub fn main() !void {
         };
         defer fdisk.fdisk_unref_table(partable);
 
-        if (fdisk.fdisk_delete_all_partitions(context) != 0) {
-            std.log.err("Failed deleting partition table data", .{});
-            return;
+        if (fdisk.fdisk_get_npartitions(context) != 0) {
+            if (fdisk.fdisk_delete_all_partitions(context) != 0) {
+                std.log.err("Failed deleting partition table data", .{});
+                return;
+            }
         }
 
         const labeltype = matches.getSingleValue("format") orelse "gpt";
@@ -308,16 +350,15 @@ pub fn main() !void {
 
     if (args.subcommandMatches("check")) |matches| {
         if (!matches.containsArgs()) {
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         }
 
         const declaration_path = matches.getSingleValue("DECLARATION") orelse {
             std.log.err("Must contain argument [DECLARATION]\n", .{});
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         };
-        const selected_format = matches.getSingleValue("format") orelse "yaml";
         const declaration_filepath = try std.fs.realpathAlloc(alloc, declaration_path);
         const file = try std.fs.openFileAbsolute(declaration_filepath, .{});
         defer file.close();
@@ -325,14 +366,11 @@ pub fn main() !void {
         const data = try file.reader().readAllAlloc(alloc, 2048);
         defer alloc.free(data);
 
-        if (std.mem.eql(u8, selected_format, "json")) {
-            _ = try std.json.parseFromSlice(Declaration, alloc, data, .{ .duplicate_field_behavior = .@"error", .ignore_unknown_fields = false });
-        }
-        if (std.mem.eql(u8, selected_format, "yaml")) {
-            var untyped = try yaml.Yaml.load(alloc, data);
-            defer untyped.deinit();
-            _ = try untyped.parse(Declaration);
-        }
+        const selected_format = std.meta.stringToEnum(TextDataFormat, matches.getSingleValue("format") orelse DEFAULT_DATA_FORMAT.str) orelse DEFAULT_DATA_FORMAT.@"enum";
+        _ = parse_formatted_text_data(Declaration, alloc, &data, selected_format) catch |e| {
+            std.log.err("Failed parsing configuration file", .{});
+            return e;
+        };
 
         if (!matches.containsArg("quiet")) {
             std.log.info("The declaration has been parsed successfully, good to go!", .{});
@@ -341,7 +379,7 @@ pub fn main() !void {
 
     if (args.subcommandMatches("dump")) |matches| {
         if (!matches.containsArgs()) {
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         }
 
@@ -350,7 +388,6 @@ pub fn main() !void {
             return;
         };
 
-        const selected_format = matches.getSingleValue("format") orelse "json";
         const device_filepath = try std.fs.realpathAlloc(alloc, device_path);
         defer alloc.free(device_filepath);
 
@@ -388,14 +425,14 @@ pub fn main() !void {
             },
         };
         defer partitions.deinit();
+
         const disklabel = fdisk.fdisk_get_label(context, null) orelse {
             std.log.err("Failed parsing partition label information from disk {s}", .{device_filepath});
             return;
         };
-        const disklabel_name = std.mem.span(fdisk.fdisk_label_get_name(disklabel));
 
         const printed: Declaration = .{
-            .label = disklabel_name,
+            .label = std.mem.span(fdisk.fdisk_label_get_name(disklabel)),
             .partitions = partitions.items,
         };
 
@@ -403,17 +440,14 @@ pub fn main() !void {
             std.log.info("{s}:", .{device_filepath});
         }
 
-        if (std.mem.eql(u8, selected_format, "json")) {
-            try std.json.stringify(printed, defaultStringify, std.io.getStdOut().writer());
-        } else if (std.mem.eql(u8, selected_format, "yaml")) {
-            try yaml.stringify(alloc, printed, std.io.getStdOut().writer());
-        }
+        const selected_format = std.meta.stringToEnum(TextDataFormat, matches.getSingleValue("format") orelse DEFAULT_DATA_FORMAT.str) orelse DEFAULT_DATA_FORMAT.@"enum";
+        try stringify_to_writer(alloc, printed, std.io.getStdOut().writer(), selected_format);
         return;
     }
 
     if (args.subcommandMatches("plan")) |matches| {
         if (!matches.containsArgs()) {
-            try app.displayHelp();
+            try app.displaySubcommandHelp();
             return;
         }
 
@@ -463,64 +497,31 @@ pub fn main() !void {
         };
         defer partitions.deinit();
 
-        const input_format = matches.getSingleValue("input-format") orelse "json";
-        const output_format = matches.getSingleValue("output-format") orelse "json";
-
-        var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
-        const stdout = bw.writer();
-        const is_quiet = matches.containsArg("quiet");
-        const DEFAULT_STRINGIFY_ERROR = "Failed writing configuration file to stdout";
+        const input_format = std.meta.stringToEnum(TextDataFormat, matches.getSingleValue("input-format") orelse DEFAULT_DATA_FORMAT.str) orelse DEFAULT_DATA_FORMAT.@"enum";
+        const output_format = std.meta.stringToEnum(TextDataFormat, matches.getSingleValue("output-format") orelse DEFAULT_DATA_FORMAT.str) orelse DEFAULT_DATA_FORMAT.@"enum";
 
         const real_path = try std.fs.realpathAlloc(alloc, declaration_filepath);
+        defer alloc.free(real_path);
+
         const file = try std.fs.openFileAbsolute(real_path, .{});
         defer file.close();
-        defer alloc.free(real_path);
+
         const raw_config_file_data = try file.reader().readAllAlloc(alloc, 2048);
         defer alloc.free(raw_config_file_data);
 
-        var selected_declaration: ?Declaration = null;
+        const selected_declaration = try parse_formatted_text_data(Declaration, alloc, &raw_config_file_data, input_format);
 
-        if (std.mem.eql(u8, input_format, "json")) {
-            selected_declaration = try std.json.parseFromSliceLeaky(Declaration, alloc, raw_config_file_data, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .use_first });
-        } else if (std.mem.eql(u8, input_format, "yaml")) {
-            var untyped = try yaml.Yaml.load(alloc, raw_config_file_data);
-            defer untyped.deinit();
-            selected_declaration = try untyped.parse(Declaration);
-        }
+        const is_quiet = matches.containsArg("quiet");
+        if (!is_quiet)
+            std.log.info("Previous state", .{});
+
+        var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
+        const stdout = bw.writer();
+        try stringify_to_writer(alloc, partitions.items, stdout, input_format);
 
         if (!is_quiet)
-            std.log.info("This is your current system configuration", .{});
-        if (std.mem.eql(u8, output_format, "yaml")) {
-            yaml.stringify(alloc, partitions.items, stdout) catch |e| {
-                std.log.err(DEFAULT_STRINGIFY_ERROR, .{});
-                return e;
-            };
-            _ = try bw.write("\n\n");
-            try bw.flush();
-            if (!is_quiet)
-                std.log.info("It will be replaced with this new configuration.", .{});
-            yaml.stringify(alloc, selected_declaration.?.partitions, stdout) catch |e| {
-                std.log.err(DEFAULT_STRINGIFY_ERROR, .{});
-                return e;
-            };
-            try bw.flush();
-        } else if (std.mem.eql(u8, output_format, "json")) {
-            std.json.stringify(partitions.items, defaultStringify, stdout) catch |e| {
-                std.log.err(DEFAULT_STRINGIFY_ERROR, .{});
-                return e;
-            };
-
-            _ = try bw.write("\n\n");
-            try bw.flush();
-            if (!is_quiet)
-                std.log.info("It will be replaced with this new configuration.", .{});
-            std.json.stringify(selected_declaration.?.partitions, defaultStringify, stdout) catch |e| {
-                std.log.err(DEFAULT_STRINGIFY_ERROR, .{});
-                return e;
-            };
-            try bw.flush();
-        }
-        try bw.flush();
+            std.log.info("New state", .{});
+        try stringify_to_writer(alloc, selected_declaration.partitions, stdout, output_format);
         return;
     }
 }

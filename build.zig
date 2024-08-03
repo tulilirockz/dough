@@ -13,9 +13,20 @@ pub fn build(b: *std.Build) !void {
     });
     exe.root_module.addImport("yazap", b.dependency("yazap", .{}).module("yazap"));
     exe.root_module.addImport("yaml", b.dependency("zig-yaml", .{}).module("yaml"));
-    exe.linkSystemLibrary("fdisk");
 
+    exe.linkSystemLibrary2("fdisk", .{
+        .needed = true,
+        .preferred_link_mode = .static,
+    });
     b.installArtifact(exe);
+
+    const fmt = b.addFmt(.{
+        .check = true,
+        .paths = &.{
+            "src/main.zig",
+        },
+    });
+    b.getInstallStep().dependOn(&fmt.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -27,7 +38,7 @@ pub fn build(b: *std.Build) !void {
     run_step.dependOn(&run_cmd.step);
 
     const exe_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = exe.root_module.root_source_file.?,
         .target = target,
         .optimize = optimize,
     });
